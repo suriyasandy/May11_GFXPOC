@@ -1,0 +1,157 @@
+# FX Volatility Monitoring App - Cleaned Version with Updated Tab 2 & Tab 3
+# Includes fixes for threshold logic, model training, prediction, and feedback logging
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os, joblib
+from datetime import datetime
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
+from keras.models import Sequential, load_model
+from keras.layers import LSTM, Dropout, Dense
+from keras.callbacks import EarlyStopping
+from arch import arch_model
+from scipy.stats import genpareto
+import plotly.graph_objects as go
+import shap
+
+# Constants
+st.set_page_config(page_title="FX Volatility App", layout="wide")
+ROLL_WINDOW = st.sidebar.slider("Rolling Window (Days)",min_value=5, max_value=120, step=5, value=10)
+ANNUALIZE = np.sqrt(252)
+PCT_THRESHOLD = 0.95
+EVT_TAIL_PCT = 0.995
+
+@st.cache_data
+def load_fx_data(roll_window):
+    df = pd.read_csv("Mock_Multi-Currency_FX_Data.csv")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.sort_values(["Currency", "Date"], inplace=True)
+    df["LogReturn"] = df.groupby("Currency")["Close"].transform(lambda x: np.log(x).diff())
+    df["Volatility"] = df.groupby("Currency")["LogReturn"].transform(lambda x: x.rolling(roll_window).std()) * ANNUALIZE
+    df["RealizedVol"] = df["OHLCVolatility"] / np.sqrt(252)
+    return df.dropna()
+
+@st.cache_data
+def create_sequences(data, window):
+    X, y = [], []
+    if isinstance(data, pd.Series):
+        data = data.dropna().values
+    else:
+        data = data[~np.isnan(data).any(axis=1)]
+    for i in range(len(data) - window):
+        X.append(data[i:i + window])
+        y.append(data[i + window])
+    return np.array(X), np.array(y)
+
+def assign_manual_group(vol):
+    if vol < 0.07:
+        return "Group 1"
+    elif vol < 0.50:
+        return "Group 2"
+    elif vol < 0.60:
+        return "Group 3"
+    else:
+        return "Group 4"
+
+@st.cache_data
+def compute_thresholds_per_currency(df, roll_window):
+    summary = []
+    for ccy, group in df.groupby("Currency"):
+        log_ret = group["LogReturn"].dropna()
+        vol_series = group["LogReturn"].rolling(roll_window).std() * ANNUALIZE
+        avg_vol = vol_series.mean()
+        realized_series = group["RealizedVol"].dropna()
+        avg_realized_vol = realized_series.mean()
+        manual_group = assign_manual_group(avg_realized_vol)
+        manual_threshold = {
+            "Group 1": 0.10, "Group 2": 0.25, "Group 3": 0.55, "Group 4": 0.80
+        }[manual_group]
+        try:
+            am = arch_model(log_ret, vol='GARCH', p=1, q=1)
+            res = am.fit(disp="off")
+            forecast = res.forecast(horizon=1).variance.values[-1][0] ** 0.5
+        except:
+            forecast = np.nan
+        tail_data = vol_series[vol_series > vol_series.quantile(EVT_TAIL_PCT)]
+        try:
+            evt_params = genpareto.fit(tail_data)
+            evt_threshold = genpareto.ppf(0.999, *evt_params)
+        except:
+            evt_threshold = np.nan
+        summary.append({
+            "Currency": ccy.upper(),
+            "AvgVol": avg_vol,
+            "AvgRealizedVol": avg_realized_vol,
+            "ManualGroup": manual_group,
+            "ManualThreshold": manual_threshold,
+            "GARCH_Forecast": forecast,
+            "95th_Pct": vol_series.quantile(PCT_THRESHOLD),
+            "EVT_Threshold": evt_threshold
+        })
+    df_out = pd.DataFrame(summary)
+    df_out["FinalThreshold"] = df_out[["95th_Pct", "GARCH_Forecast", "EVT_Threshold"]].max(axis=1)
+    return df_out
+
+def train_and_save_models(currency_name, df, save_path="models", window=ROLL_WINDOW):
+    os.makedirs(save_path, exist_ok=True)
+    df_currency = df[df["Currency"] == currency_name][["Date", "Close"]].dropna().copy()
+    df_currency.set_index("Date", inplace=True)
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df_currency)
+    X, y = create_sequences(scaled_data, window)
+    X_rf = X.reshape(X.shape[0], -1)
+    X_lstm = X.reshape(X.shape[0], X.shape[1], 1)
+    y = y.ravel()
+    rf = GridSearchCV(RandomForestRegressor(random_state=42), {"n_estimators": [100], "max_depth": [10, None]}, cv=TimeSeriesSplit(3))
+    rf.fit(X_rf, y)
+    joblib.dump(rf.best_estimator_, f"{save_path}/rf_{currency_name}_{ROLL_WINDOW}.pkl")
+    svr = GridSearchCV(SVR(), {"C": [10], "gamma": ["scale"], "epsilon": [0.01]}, cv=TimeSeriesSplit(3))
+    svr.fit(X_rf, y)
+    joblib.dump(svr.best_estimator_, f"{save_path}/svr_{currency_name}_{ROLL_WINDOW}.pkl")
+    lr = LinearRegression().fit(X_rf, y)
+    joblib.dump(lr, f"{save_path}/lr_{currency_name}_{ROLL_WINDOW}.pkl")
+    lstm = Sequential()
+    lstm.add(LSTM(64, input_shape=(X_lstm.shape[1], X_lstm.shape[2])))
+    lstm.add(Dropout(0.2))
+    lstm.add(Dense(1))
+    lstm.compile(optimizer="adam", loss="mse")
+    lstm.fit(X_lstm, y, epochs=20, batch_size=16, verbose=0, callbacks=[EarlyStopping(patience=3)])
+    lstm.save(f"{save_path}/lstm_{currency_name}_{ROLL_WINDOW}.h5")
+    joblib.dump(scaler, f"{save_path}/scaler_{currency_name}_{ROLL_WINDOW}.pkl")
+    return True
+
+def load_models(currency_name, path="models"):
+    try:
+        rf = joblib.load(f"{path}/rf_{currency_name}_{ROLL_WINDOW}.pkl")
+        svr = joblib.load(f"{path}/svr_{currency_name}_{ROLL_WINDOW}.pkl")
+        lr = joblib.load(f"{path}/lr_{currency_name}_{ROLL_WINDOW}.pkl")
+        lstm = load_model(f"{path}/lstm_{currency_name}_{ROLL_WINDOW}.h5", compile=False)
+        scaler = joblib.load(f"{path}/scaler_{currency_name}_{ROLL_WINDOW}.pkl")
+        return {"Random Forest": rf, "SVR": svr, "Linear Regression": lr, "LSTM": lstm}, scaler
+    except Exception as e:
+        st.warning(f"Model loading failed for {currency_name} (window {ROLL_WINDOW}): {e}")
+        return None, None
+
+# Load dataset and thresholds
+df = load_fx_data(ROLL_WINDOW)
+df_summary = compute_thresholds_per_currency(df, ROLL_WINDOW)
+
+# App Tabs
+from tabs import overview_tab, threshold_tab_v2, forecasting_tab_v2, tab4_final_summary, tab5_cross_currency
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Overview", "Threshold Calibration", "Forecasting & Alerts",
+    "Final Summary", "Cross-Currency View"
+])
+
+with tab1: overview_tab(df, ROLL_WINDOW)
+with tab2: threshold_tab_v2(df, df_summary, ROLL_WINDOW)
+with tab3: forecasting_tab_v2(df, df_summary, ROLL_WINDOW, train_and_save_models, load_models)
+with tab4: tab4_final_summary(df, df_summary, ROLL_WINDOW, load_models)
+with tab5: tab5_cross_currency(df, df_summary, ROLL_WINDOW, create_sequences)
