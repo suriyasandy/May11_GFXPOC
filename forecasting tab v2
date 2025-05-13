@@ -1,0 +1,114 @@
+def forecasting_tab_v2(df, df_summary, ROLL_WINDOW, train_and_save_models, load_models):
+    st.header("📈 Forecasting & Alerts")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab3_currency")
+    test_days = st.slider("Select Test Period (days before latest date)", min_value=5, max_value=90, step=5, value=20)
+
+    if selected_currency:
+        df_ccy = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+        df_ccy.set_index("Date", inplace=True)
+
+        latest_date = df_ccy.index.max()
+        test_start = latest_date - pd.Timedelta(days=test_days)
+        train_df = df_ccy[df_ccy.index < test_start][["Close"]]
+        test_df = df_ccy[df_ccy.index >= test_start][["Close"]]
+
+        if train_df.empty or test_df.empty:
+            st.warning("Not enough data for selected test period.")
+            return
+
+        model_dir = "models"
+        models, scaler = load_models(selected_currency.upper(), path=model_dir)
+
+        if models is None:
+            st.info(f"Training models for {selected_currency}...")
+            train_and_save_models(selected_currency.upper(), df, save_path=model_dir, window=ROLL_WINDOW)
+            models, scaler = load_models(selected_currency.upper(), path=model_dir)
+
+        scaled_all = scaler.fit_transform(df_ccy[["Close"]])
+        scaled_train = scaler.transform(train_df)
+        scaled_test = scaler.transform(test_df)
+
+        def create_sequences(data, window):
+            X, y = [], []
+            for i in range(len(data) - window):
+                X.append(data[i:i + window])
+                y.append(data[i + window])
+            return np.array(X), np.array(y)
+
+        X_train, y_train = create_sequences(scaled_train, ROLL_WINDOW)
+        X_test_seq = [scaled_all[-(len(test_df) + ROLL_WINDOW - i):-len(test_df) + i] for i in range(len(test_df))]
+        X_test_seq = np.array(X_test_seq)
+
+        X_train_rf = X_train.reshape(X_train.shape[0], -1)
+        X_test_rf = X_test_seq.reshape(X_test_seq.shape[0], -1)
+        X_train_lstm = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+        X_test_lstm = X_test_seq.reshape(X_test_seq.shape[0], X_test_seq.shape[1], 1)
+
+        y_true_train = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+        y_true_test = test_df["Close"].values
+
+        model_outputs_test = {}
+        metrics = []
+
+        model_names = ["Random Forest", "Linear Regression", "SVR", "LSTM", "ARIMA-GARCH"]
+        for model_name in model_names:
+            try:
+                if model_name == "LSTM":
+                    model = models[model_name]
+                    preds_test = model.predict(X_test_lstm).ravel()
+                    preds_test_inv = scaler.inverse_transform(preds_test.reshape(-1, 1)).flatten()
+
+                elif model_name == "ARIMA-GARCH":
+                    from arch import arch_model
+                    from statsmodels.tsa.arima.model import ARIMA
+                    close_returns = df_ccy["Close"].pct_change().dropna()
+                    split_idx = len(close_returns) - test_days
+                    train_ret = close_returns.iloc[:split_idx]
+                    test_ret = close_returns.iloc[split_idx:]
+
+                    arima_model = ARIMA(train_ret, order=(1, 0, 1)).fit()
+                    arima_resid = arima_model.resid
+                    garch = arch_model(arima_resid, vol='GARCH', p=1, q=1).fit(disp='off')
+                    forecasted_returns = arima_model.forecast(steps=len(test_ret))
+                    pred_prices = [train_df["Close"].iloc[-1]]
+                    for r in forecasted_returns:
+                        pred_prices.append(pred_prices[-1] * (1 + r))
+                    preds_test_inv = np.array(pred_prices[1:])
+
+                else:
+                    model = models[model_name]
+                    preds_test = model.predict(X_test_rf)
+                    preds_test_inv = scaler.inverse_transform(preds_test.reshape(-1, 1)).flatten()
+
+                model_outputs_test[model_name] = preds_test_inv
+                metrics.append({
+                    "Model": model_name,
+                    "MAPE": mean_absolute_percentage_error(y_true_test, preds_test_inv) * 100,
+                    "RMSE": np.sqrt(mean_squared_error(y_true_test, preds_test_inv))
+                })
+
+            except Exception as e:
+                st.warning(f"Model {model_name} failed: {e}")
+
+        # Plot forecast
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=test_df.index, y=y_true_test, name="Actual", line=dict(color="white")))
+        for m in model_outputs_test:
+            fig.add_trace(go.Scatter(x=test_df.index, y=model_outputs_test[m], name=m))
+
+        best_model = min(metrics, key=lambda x: x["MAPE"])
+        mape_pct = best_model["MAPE"] / 100
+        preds_best = model_outputs_test[best_model["Model"]]
+        upper = preds_best * (1 + mape_pct)
+        lower = preds_best * (1 - mape_pct)
+        flags = (y_true_test > upper) | (y_true_test < lower)
+
+        fig.add_trace(go.Scatter(x=test_df.index, y=upper, name="MAPE Upper", line=dict(dash="dot", color="green")))
+        fig.add_trace(go.Scatter(x=test_df.index, y=lower, name="MAPE Lower", line=dict(dash="dot", color="green")))
+        fig.add_trace(go.Scatter(x=test_df.index[flags], y=y_true_test[flags], mode="markers",
+                                 name="Breach", marker=dict(color="red", symbol="x", size=8)))
+        fig.update_layout(title="Forecast vs Actual", xaxis_title="Date", yaxis_title="FX Rate")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown(f"### ✅ Best Model: `{best_model['Model']}` | MAPE: `{best_model['MAPE']:.2f}%` | RMSE: `{best_model['RMSE']:.4f}`")
