@@ -1,0 +1,134 @@
+def tab4_final_summary(df, df_summary, ROLL_WINDOW, load_models):
+    st.header("📊 Final Thresholds & Forecast Summary")
+
+    @st.cache_data
+    def load_best_mape_summary():
+        try:
+            log_df = pd.read_csv("logs/model_feedback_log.csv")
+            log_df["Currency"] = log_df["Currency"].str.strip().str.upper()
+            log_df["RollingWindow"] = log_df["RollingWindow"].astype(int)
+            latest = log_df[log_df["RollingWindow"] == ROLL_WINDOW].sort_values("RunDate", ascending=False).drop_duplicates("Currency")
+            return latest[["Currency", "Model", "MAPE", "RMSE"]].rename(columns={"MAPE": "Best_MAPE", "RMSE": "Best_RMSE"})
+        except Exception as e:
+            st.error(f"Error loading model summary: {e}")
+            return pd.DataFrame(columns=["Currency", "Model", "Best_MAPE", "Best_RMSE"])
+
+    def create_sequences(data, window):
+        X, y = [], []
+        for i in range(len(data) - window):
+            X.append(data[i:i + window])
+            y.append(data[i + window])
+        return np.array(X), np.array(y)
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab4_currency")
+    method = st.selectbox("Select Threshold Method", ["FinalDynamic", "CUSUM", "ZScore", "Mahalanobis", "HMM"], key="tab4_method")
+    simulate_spike = st.checkbox("🔁 Simulate Volatility Spike (last 5 days)", value=False)
+
+    if selected_currency:
+        best_mape_df = load_best_mape_summary()
+        df_summary["Currency"] = df_summary["Currency"].str.upper()
+        df_final = df_summary.merge(best_mape_df, on="Currency", how="left", validate="one_to_one")
+        row = df_final[df_final["Currency"] == selected_currency.upper()].iloc[0]
+
+        trend_df = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+        vol = trend_df["Volatility"].copy()
+
+        if simulate_spike and len(vol) > 10:
+            vol.iloc[-5:] += vol.mean() * 1.5
+            st.warning("⚠️ Injected synthetic volatility spike in last 5 days")
+
+        # Threshold logic
+        if method == "FinalDynamic":
+            trend_df["DynThreshold"] = vol.rolling(ROLL_WINDOW, min_periods=ROLL_WINDOW).quantile(0.95)
+        elif method == "CUSUM":
+            model = rpt.Pelt(model="rbf").fit(vol.dropna().values)
+            change_points = model.predict(pen=10)
+            threshold_series = pd.Series(np.nan, index=trend_df.index)
+            for i in range(1, len(change_points)):
+                start, end = change_points[i-1], change_points[i]
+                threshold_series.iloc[start:end] = vol.iloc[start:end].mean()
+            trend_df["DynThreshold"] = threshold_series
+        elif method == "ZScore":
+            z_scores = zscore(vol.fillna(method='ffill'))
+            trend_df["DynThreshold"] = 2  # Fixed z threshold
+        elif method == "Mahalanobis":
+            X = vol.dropna().values.reshape(-1, 1)
+            robust_cov = MinCovDet().fit(X)
+            dist = robust_cov.mahalanobis(X)
+            dist_series = pd.Series(np.nan, index=trend_df.index)
+            dist_series.iloc[-len(dist):] = dist
+            threshold = np.percentile(dist, 97.5)
+            trend_df["DynThreshold"] = threshold
+        elif method == "HMM":
+            hmm = GaussianHMM(n_components=2, covariance_type="diag", n_iter=100)
+            try:
+                vol_clean = vol.dropna().values.reshape(-1, 1)
+                hmm.fit(vol_clean)
+                hidden_states = hmm.predict(vol_clean)
+                hmm_series = pd.Series(np.nan, index=trend_df.index)
+                hmm_series.iloc[-len(hidden_states):] = hidden_states
+                trend_df["HMM_State"] = hmm_series
+                trend_df["DynThreshold"] = np.nan
+            except:
+                st.warning("HMM model training failed.")
+
+        # MAPE forecast bands
+        mape_pct = row["Best_MAPE"] / 100 if pd.notnull(row["Best_MAPE"]) else 0.05
+        trend_df["Volatility"] = vol
+        trend_df["UpperMAPE"] = vol * (1 + mape_pct)
+        trend_df["LowerMAPE"] = vol * (1 - mape_pct)
+        flag_mask = (vol > trend_df["UpperMAPE"]) | (vol < trend_df["LowerMAPE"])
+
+        # VaR calculation
+        from arch import arch_model
+        log_ret = np.log(trend_df["Close"]).diff().dropna()
+        garch_model = arch_model(log_ret, vol='GARCH', p=1, q=1)
+        garch_fit = garch_model.fit(disp="off")
+        forecast = garch_fit.forecast(horizon=1)
+        var_std = np.sqrt(forecast.variance.iloc[-1, 0])
+        mean_ret = log_ret.mean()
+        VaR_95 = -(mean_ret + 1.65 * var_std)
+        VaR_99 = -(mean_ret + 2.33 * var_std)
+
+        # Summary display
+        st.subheader(f"📌 Summary for {selected_currency}")
+        st.markdown(f"""
+        - **Avg OHLC Realized Volatility**: `{round(row['AvgRealizedVol'], 4)}`  
+        - **Manual Threshold**: `{round(row['ManualThreshold'], 4)}`  
+        - **Selected Threshold Method**: `{method}`  
+        - **Avg Log-Return Volatility**: `{round(row['AvgVol'], 4)}`  
+        - **Final Dynamic Threshold**: `{round(row['FinalThreshold'], 4)}`  
+        - **Best Model**: `{row['Model']}`  
+        - **MAPE**: `{round(row['Best_MAPE'], 2)}%`  
+        - **VaR (95%)**: `{VaR_95:.4f}`, **VaR (99%)**: `{VaR_99:.4f}`
+        """)
+
+        # Plot
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=trend_df["Date"], y=vol, name="Volatility", line=dict(color="white")))
+        if method != "HMM":
+            fig.add_trace(go.Scatter(x=trend_df["Date"], y=trend_df["DynThreshold"], name=f"{method} Threshold", line=dict(color="orange", dash="dash")))
+        else:
+            if "HMM_State" in trend_df:
+                for state in trend_df["HMM_State"].dropna().unique():
+                    mask = trend_df["HMM_State"] == state
+                    fig.add_vrect(x0=trend_df["Date"][mask].min(), x1=trend_df["Date"][mask].max(),
+                                  fillcolor="blue" if state == 0 else "purple", opacity=0.2, line_width=0,
+                                  annotation_text=f"Regime {int(state)}", annotation_position="top left")
+
+        fig.add_hline(y=row["ManualThreshold"], line_color="red", line_dash="dot", annotation_text="Manual Threshold")
+        fig.add_trace(go.Scatter(x=trend_df[flag_mask]["Date"], y=vol[flag_mask],
+                                 mode="markers", name="MAPE Flagged", marker=dict(color="red", size=7)))
+        fig.add_trace(go.Scatter(x=trend_df["Date"], y=trend_df["UpperMAPE"], name="MAPE Upper", line=dict(dash="dot", color="green")))
+        fig.add_trace(go.Scatter(x=trend_df["Date"], y=trend_df["LowerMAPE"], name="MAPE Lower", line=dict(dash="dot", color="green")))
+        fig.update_layout(title=f"{selected_currency}: Volatility vs {method} Threshold",
+                          xaxis_title="Date", yaxis_title="Annualized Volatility")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("""### 🧾 Interpretation
+        - 🔴 Manual: OHLC static logic  
+        - 🟠 Dynamic: Based on selected method  
+        - 🟢 MAPE Band: Forecast-based CI  
+        - 🔵 VaR: Risk tolerance under GARCH-based prediction  
+        - ⚙️ Toggle spike to simulate volatility events  
+        """)
