@@ -1,0 +1,73 @@
+    with tab2:
+        currencies = df["Currency"].unique().tolist()
+        pairs = [(b, q) for b in currencies for q in currencies if b != q]
+        selected_pair = st.selectbox("Select Cross Pair", [f"{b}/{q}" for b, q in pairs])
+        base_ccy, quote_ccy = selected_pair.split("/")
+
+        base = df[df["Currency"] == base_ccy].copy()
+        quote = df[df["Currency"] == quote_ccy].copy()
+        merged = pd.merge(base, quote, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}"))
+        merged["Synthetic"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
+        merged["LogReturn"] = np.log(merged["Synthetic"] / merged["Synthetic"].shift(1))
+        merged["Volatility"] = merged["LogReturn"].rolling(roll_window, min_periods=roll_window).std() * np.sqrt(252)
+        df_syn = merged[["Date", "Volatility"]].dropna().rename(columns={"Date": "ds", "Volatility": "y"})
+
+        if len(df_syn) < 60:
+            st.warning("Not enough data for this pair.")
+            return
+
+        df_train = df_syn[:-30]
+        df_test = df_syn[-30:]
+        m = Prophet(interval_width=0.90, daily_seasonality=False)
+        m.fit(df_train)
+        forecast = m.predict(df_syn[["ds"]])
+        f_test = forecast.tail(30)
+
+        # Manual threshold = max of the two legs
+        df_summ = df_summary.set_index("Currency")
+        try:
+            base_th = df_summ.loc[base_ccy.upper(), "ManualThreshold"]
+            quote_th = df_summ.loc[quote_ccy.upper(), "ManualThreshold"]
+            manual_cross = max(base_th, quote_th)
+        except:
+            manual_cross = None
+
+        # Flag breaches
+        y_true = df_test["y"].values
+        y_pred_upper = f_test["yhat_upper"].values
+        flags = y_true > y_pred_upper
+        flagged_dates = df_test["ds"].values[flags]
+        flagged_vals = y_true[flags]
+        flagged_dev = ((flagged_vals - y_pred_upper[flags]) / y_pred_upper[flags]) * 100
+
+        # Plot
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df_syn["ds"], y=df_syn["y"], name="Synthetic Volatility", line=dict(color="gray")))
+        fig2.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat"], name="Forecast", line=dict(color="blue")))
+        fig2.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_upper"], name="Upper CI", line=dict(color="lightblue", dash="dot")))
+        fig2.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_lower"], name="Lower CI", line=dict(color="lightblue", dash="dot")))
+        fig2.add_vrect(x0=df_test["ds"].min(), x1=df_test["ds"].max(), fillcolor="orange", opacity=0.08, line_width=0, annotation_text="Test Window")
+
+        if manual_cross:
+            fig2.add_hline(y=manual_cross, line_color="red", line_dash="dash", annotation_text="Manual Threshold")
+
+        fig2.add_trace(go.Scatter(
+            x=flagged_dates, y=flagged_vals,
+            mode="markers", name="Flagged Breach",
+            marker=dict(color="red", symbol="x", size=9),
+            text=[f"Deviation: {d:.2f}%" for d in flagged_dev],
+            hoverinfo="text+x+y"
+        ))
+
+        fig2.update_layout(title=f"{base_ccy}/{quote_ccy} Synthetic Volatility Forecast + Thresholds", height=600)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # Optional breach table
+        flagged_df = df_test.iloc[flags].copy()
+        flagged_df["UpperBand"] = y_pred_upper[flags]
+        flagged_df["Deviation %"] = flagged_dev
+        if not flagged_df.empty:
+            st.markdown("### 🔍 Cross-Pair Flagged Breaches")
+            st.dataframe(flagged_df[["ds", "y", "UpperBand", "Deviation %"]].rename(columns={
+                "ds": "Date", "y": "Volatility"
+            }), use_container_width=True)
