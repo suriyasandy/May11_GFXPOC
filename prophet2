@@ -1,0 +1,63 @@
+from prophet import Prophet
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from sklearn.metrics import mean_absolute_percentage_error
+
+def prophet_volatility_tab(df, df_summary, roll_window=30):
+    st.header("📉 Prophet Forecasting on Volatility")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab6_vol_currency")
+    forecast_days = st.slider("Forecast Horizon (days)", 10, 90, 30)
+
+    df_cur = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+
+    # --- Step 1: Compute log returns and rolling volatility ---
+    df_cur["LogReturn"] = np.log(df_cur["Close"] / df_cur["Close"].shift(1))
+    df_cur["Volatility"] = df_cur["LogReturn"].rolling(window=roll_window, min_periods=roll_window).std() * np.sqrt(252)
+    df_vol = df_cur[["Date", "Volatility"]].dropna().copy()
+    df_vol = df_vol.rename(columns={"Date": "ds", "Volatility": "y"})
+
+    if df_vol.empty or len(df_vol) < 100:
+        st.warning("Not enough data to forecast volatility. Please select another currency or smaller rolling window.")
+        return
+
+    # --- Step 2: Train Prophet ---
+    model = Prophet(interval_width=0.90, daily_seasonality=False)
+    model.fit(df_vol)
+
+    future = model.make_future_dataframe(periods=forecast_days)
+    forecast = model.predict(future)
+
+    # --- Step 3: Get Manual Threshold from Summary ---
+    thresh = df_summary[df_summary["Currency"] == selected_currency.upper()]["ManualThreshold"]
+    manual_thresh = thresh.values[0] if not thresh.empty else None
+
+    # --- Step 4: MAPE (on in-sample forecast) ---
+    merged = pd.merge(df_vol, forecast[["ds", "yhat"]], on="ds", how="left")
+    mape = mean_absolute_percentage_error(merged["y"], merged["yhat"]) * 100
+
+    # --- Step 5: Plot with manual threshold ---
+    st.subheader(f"{selected_currency} Volatility Forecast (Prophet)")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_vol["ds"], y=df_vol["y"], name="Observed Volatility", line=dict(color="black")))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat"], name="Forecast", line=dict(color="blue")))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_upper"], name="Upper CI", line=dict(color="lightblue", dash="dot")))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_lower"], name="Lower CI", line=dict(color="lightblue", dash="dot")))
+
+    if manual_thresh is not None:
+        fig.add_hline(y=manual_thresh, line_color="red", line_dash="dash", annotation_text="Manual Threshold")
+
+    fig.update_layout(title=f"{selected_currency}: Volatility Forecast + Threshold",
+                      xaxis_title="Date", yaxis_title="Annualized Volatility", height=500)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(f"✅ **Train MAPE**: `{mape:.2f}%`")
+    st.markdown("### 📘 Interpretation")
+    st.markdown("""
+    - Prophet model forecasts future **volatility**, not FX rates  
+    - Shaded band = 90% confidence interval for volatility  
+    - Red dashed line = manual threshold from business logic  
+    - This helps assess future risk vs fixed thresholds  
+    """)
