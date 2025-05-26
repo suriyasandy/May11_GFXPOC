@@ -1,0 +1,8 @@
+method = st.selectbox("Select Threshold Method", ["FinalDynamic", "CUSUM", "ZScore", "Mahalanobis", "HMM", "Bollinger"], key="tab4_method")
+
+elif method == "Bollinger":
+    mean_vol = vol.rolling(ROLL_WINDOW).mean()
+    std_vol = vol.rolling(ROLL_WINDOW).std()
+    trend_df["DynThreshold"] = mean_vol + 2 * std_vol
+
+- **Bollinger Band Threshold**: Volatility breaches upper limit of a 2σ band from rolling mean
