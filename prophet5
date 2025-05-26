@@ -1,0 +1,130 @@
+from prophet import Prophet
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from sklearn.metrics import mean_absolute_percentage_error
+from itertools import product
+
+def prophet_volatility_train_test_tab(df, df_summary, roll_window=30):
+    st.header("📊 Prophet Volatility Thresholding with Tuning (Train/Test)")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab6_vol_currency")
+    test_days = st.slider("Test Window (days)", 10, 90, 30)
+
+    df_cur = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+    df_cur["LogReturn"] = np.log(df_cur["Close"] / df_cur["Close"].shift(1))
+    df_cur["Volatility"] = df_cur["LogReturn"].rolling(window=roll_window, min_periods=roll_window).std() * np.sqrt(252)
+    df_vol = df_cur[["Date", "Volatility"]].dropna().copy()
+    df_vol = df_vol.rename(columns={"Date": "ds", "Volatility": "y"})
+
+    if df_vol.empty or len(df_vol) < test_days + 50:
+        st.warning("Not enough data for train/test split. Try reducing the test window.")
+        return
+
+    df_train = df_vol[:-test_days]
+    df_test = df_vol[-test_days:]
+    future_test = df_test[["ds"]]
+
+    # --- Hyperparameter grid search ---
+    st.markdown("🔍 Tuning Prophet hyperparameters...")
+    param_grid = {
+        "changepoint_prior_scale": [0.01, 0.1, 0.5],
+        "seasonality_prior_scale": [1.0, 5.0, 10.0]
+    }
+
+    all_params = [dict(zip(param_grid, v)) for v in product(*param_grid.values())]
+    best_mape = float("inf")
+    best_params = None
+    best_model = None
+    best_forecast = None
+
+    for params in all_params:
+        try:
+            m = Prophet(interval_width=0.90,
+                        changepoint_prior_scale=params["changepoint_prior_scale"],
+                        seasonality_prior_scale=params["seasonality_prior_scale"],
+                        daily_seasonality=False)
+            m.fit(df_train)
+            forecast = m.predict(future_test)
+            mape = mean_absolute_percentage_error(df_test["y"], forecast["yhat"]) * 100
+            if mape < best_mape:
+                best_mape = mape
+                best_params = params
+                best_model = m
+                best_forecast = forecast
+        except Exception as e:
+            st.warning(f"Failed params: {params}, Error: {e}")
+            continue
+
+    if best_model is None:
+        st.error("All parameter combinations failed. Check data.")
+        return
+
+    st.success(f"✅ Best Params: {best_params} | Test MAPE: {best_mape:.2f}%")
+
+    # Full forecast with best model
+    full_forecast = best_model.predict(df_vol[["ds"]])
+    forecast_train = full_forecast.iloc[:-test_days]
+    forecast_test = full_forecast.tail(test_days)
+
+    # Manual threshold
+    thresh = df_summary[df_summary["Currency"] == selected_currency.upper()]["ManualThreshold"]
+    manual_thresh = thresh.values[0] if not thresh.empty else None
+
+    # Breach flags
+    flags = df_test["y"].values > forecast_test["yhat_upper"].values
+    flagged_dates = df_test["ds"].values[flags]
+    flagged_vols = df_test["y"].values[flags]
+    flagged_ci = forecast_test["yhat_upper"].values[flags]
+    flagged_dev = ((flagged_vols - flagged_ci) / flagged_ci) * 100
+
+    # --- Plot ---
+    st.subheader(f"{selected_currency} Volatility Forecast (Train + Test + Tuning)")
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(x=df_vol["ds"], y=df_vol["y"], name="Actual Volatility", line=dict(color="gray")))
+    fig.add_trace(go.Scatter(x=forecast_train["ds"], y=forecast_train["yhat"], name="Forecast (Train)", line=dict(color="blue")))
+    fig.add_trace(go.Scatter(x=forecast_train["ds"], y=forecast_train["yhat_upper"], name="Upper CI (Train)", line=dict(color="lightblue", dash="dot")))
+    fig.add_trace(go.Scatter(x=forecast_train["ds"], y=forecast_train["yhat_lower"], name="Lower CI (Train)", line=dict(color="lightblue", dash="dot")))
+
+    fig.add_trace(go.Scatter(x=forecast_test["ds"], y=forecast_test["yhat"], name="Forecast (Test)", line=dict(color="orange")))
+    fig.add_trace(go.Scatter(x=forecast_test["ds"], y=forecast_test["yhat_upper"], name="Upper CI (Test)", line=dict(color="lightsalmon", dash="dot")))
+    fig.add_trace(go.Scatter(x=forecast_test["ds"], y=forecast_test["yhat_lower"], name="Lower CI (Test)", line=dict(color="lightsalmon", dash="dot")))
+
+    fig.add_vrect(x0=df_test["ds"].min(), x1=df_test["ds"].max(),
+                  fillcolor="orange", opacity=0.08, layer="below", line_width=0,
+                  annotation_text="Test Window", annotation_position="top left")
+
+    if manual_thresh is not None:
+        fig.add_hline(y=manual_thresh, line_color="red", line_dash="dash", annotation_text="Manual Threshold")
+
+    fig.add_trace(go.Scatter(
+        x=flagged_dates, y=flagged_vols,
+        mode="markers", name="Flagged Breach",
+        marker=dict(color="red", size=9, symbol="x"),
+        text=[f"Deviation: {d:.2f}%" for d in flagged_dev],
+        hoverinfo="text+x+y"
+    ))
+
+    fig.update_layout(title=f"{selected_currency}: Prophet Threshold Forecast with Tuning",
+                      xaxis_title="Date", yaxis_title="Annualized Volatility", height=600)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Flag table
+    flagged_df = df_test.iloc[flags].copy()
+    flagged_df["UpperBand"] = flagged_ci
+    flagged_df["Deviation %"] = flagged_dev
+    if not flagged_df.empty:
+        st.markdown("### 🔍 Flagged Breaches")
+        st.dataframe(flagged_df[["ds", "y", "UpperBand", "Deviation %"]].rename(columns={
+            "ds": "Date", "y": "Volatility"
+        }), use_container_width=True)
+
+    st.markdown("### 📘 Interpretation")
+    st.markdown(f"""
+    - Model automatically tuned using grid search for best MAPE  
+    - Forecast bands and test breaches shown clearly  
+    - Manual threshold overlaid for comparison  
+    - Best params: `{best_params}` | Test MAPE: `{best_mape:.2f}%`  
+    """)
