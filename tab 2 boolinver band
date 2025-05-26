@@ -1,0 +1,12 @@
+# --- Bollinger Band Threshold ---
+mean_vol = df_currency["Volatility"].rolling(ROLL_WINDOW).mean()
+std_vol = df_currency["Volatility"].rolling(ROLL_WINDOW).std()
+df_currency["Bollinger_Upper"] = mean_vol + 2 * std_vol
+
+fig.add_trace(go.Scatter(
+    x=df_currency["Date"], y=df_currency["Bollinger_Upper"],
+    name="Bollinger Upper (2σ)", line=dict(color="cyan", dash="dot")
+))
+
+- **Bollinger Band**: Adaptive range (±2 std dev) used to detect upper volatility spikes
+
