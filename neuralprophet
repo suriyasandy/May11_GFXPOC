@@ -1,0 +1,45 @@
+from neuralprophet import NeuralProphet
+import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def neuralprophet_forecasting_tab(df):
+    st.header("🔮 NeuralProphet FX Forecasting (Deep + Probabilistic)")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab6_currency")
+    forecast_days = st.slider("Forecast Horizon (days)", 10, 90, 30)
+
+    df_cur = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+    df_cur = df_cur.rename(columns={"Date": "ds", "Close": "y"})[["ds", "y"]]
+    df_cur["ds"] = pd.to_datetime(df_cur["ds"])
+    df_cur = df_cur.dropna().copy()
+
+    st.markdown("⚙️ Training NeuralProphet model...")
+    m = NeuralProphet(
+        yearly_seasonality=False,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        learning_rate=1.0,
+        quantiles=[0.05, 0.5, 0.95]
+    )
+    metrics = m.fit(df_cur, freq="D", epochs=100, progress="bar")
+
+    future = m.make_future_dataframe(df_cur, periods=forecast_days)
+    forecast = m.predict(future)
+
+    # Plot
+    st.subheader(f"{selected_currency} Forecast (with Prediction Intervals)")
+    fig = m.plot(forecast, xlabel="Date", ylabel="FX Rate")
+    st.pyplot(fig)
+
+    # Evaluation (Train MAPE)
+    forecast_valid = forecast.iloc[:len(df_cur)]
+    mape = abs((df_cur['y'].values - forecast_valid['yhat1'].values) / df_cur['y'].values).mean() * 100
+    st.markdown(f"✅ **Train MAPE**: `{mape:.2f}%`")
+
+    st.markdown("### 📘 Interpretation")
+    st.markdown("""
+    - Forecast uses a deep time series model (NeuralProphet) trained on historical close prices  
+    - Shaded bands show 90% prediction interval (5th–95th percentile)  
+    - Useful for forward-looking thresholds or confidence-based deviation flags  
+    """)
