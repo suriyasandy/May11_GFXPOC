@@ -1,0 +1,55 @@
+from prophet import Prophet
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from sklearn.metrics import mean_absolute_percentage_error
+
+def prophet_forecasting_tab(df, df_summary):
+    st.header("🔮 Prophet FX Forecasting (Interactive + Threshold)")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab6_currency")
+    forecast_days = st.slider("Forecast Horizon (days)", 10, 90, 30)
+
+    df_cur = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+    df_cur = df_cur.rename(columns={"Date": "ds", "Close": "y"})[["ds", "y"]]
+    df_cur["ds"] = pd.to_datetime(df_cur["ds"])
+    df_cur = df_cur.dropna()
+
+    st.markdown("⚙️ Training Prophet model...")
+    model = Prophet(interval_width=0.90, daily_seasonality=False)
+    model.fit(df_cur)
+
+    future = model.make_future_dataframe(periods=forecast_days)
+    forecast = model.predict(future)
+
+    # Merge for evaluation
+    merged = pd.merge(df_cur, forecast[["ds", "yhat"]], on="ds", how="left")
+    mape = mean_absolute_percentage_error(merged["y"], merged["yhat"]) * 100
+
+    # Fetch manual threshold from summary
+    manual_thresh = df_summary[df_summary["Currency"] == selected_currency.upper()]["ManualThreshold"]
+    manual_thresh = manual_thresh.values[0] if not manual_thresh.empty else None
+
+    # Plotly interactive chart
+    st.subheader(f"{selected_currency} Forecast (with Threshold & CI)")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_cur["ds"], y=df_cur["y"], mode="lines", name="Actual", line=dict(color="black")))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat"], mode="lines", name="Forecast", line=dict(color="blue")))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_upper"], mode="lines", name="Upper CI", line=dict(color="lightblue", dash="dot")))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_lower"], mode="lines", name="Lower CI", line=dict(color="lightblue", dash="dot")))
+
+    if manual_thresh is not None:
+        fig.add_hline(y=manual_thresh, line_color="red", line_dash="dash", annotation_text="Manual Threshold")
+
+    fig.update_layout(title=f"{selected_currency}: Prophet Forecast with Confidence Interval",
+                      xaxis_title="Date", yaxis_title="FX Rate", height=500)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(f"✅ **Train MAPE**: `{mape:.2f}%`")
+
+    st.markdown("### 📘 Interpretation")
+    st.markdown(f"""
+    - Forecast made using **Prophet** with 90% prediction interval  
+    - **Manual threshold** plotted in red for business comparison  
+    - Useful to assess forward risk against static benchmarks  
+    """)
