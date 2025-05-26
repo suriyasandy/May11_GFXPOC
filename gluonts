@@ -1,0 +1,62 @@
+import pandas as pd
+import numpy as np
+import streamlit as st
+import matplotlib.pyplot as plt
+from gluonts.dataset.common import ListDataset
+from gluonts.model.deepar import DeepAREstimator
+from gluonts.mx.trainer import Trainer
+from gluonts.evaluation.backtest import make_evaluation_predictions
+from gluonts.evaluation import Evaluator
+from gluonts.mx import Trainer
+
+def gluonts_forecasting_tab(df):
+    st.header("🔮 GluonTS Forecasting (DeepAR)")
+
+    selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab6_currency")
+    forecast_horizon = st.slider("Forecast Horizon (days)", 10, 90, 30)
+
+    df_cur = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+    df_cur.set_index("Date", inplace=True)
+
+    # Resample daily and fill missing
+    df_daily = df_cur["Close"].resample("1D").ffill().dropna()
+
+    # GluonTS format
+    start_date = df_daily.index[0]
+    target_series = df_daily.values.tolist()
+    freq = "1D"
+
+    training_data = ListDataset(
+        [{"start": start_date, "target": target_series[:-forecast_horizon]}],
+        freq=freq
+    )
+
+    test_data = ListDataset(
+        [{"start": start_date, "target": target_series}],
+        freq=freq
+    )
+
+    with st.spinner("Training DeepAR..."):
+        estimator = DeepAREstimator(freq=freq, prediction_length=forecast_horizon, trainer=Trainer(epochs=5))
+        predictor = estimator.train(training_data)
+
+    forecast_it, ts_it = make_evaluation_predictions(dataset=test_data, predictor=predictor, num_samples=100)
+    forecasts = list(forecast_it)
+    tss = list(ts_it)
+
+    forecast = forecasts[0]
+    ts = tss[0]
+
+    # Plot forecast with intervals
+    st.subheader(f"Forecast for {selected_currency}")
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ts[-150:].plot(ax=ax, label="Observed", color="black")
+    forecast.plot(ax=ax, color="blue")
+    plt.legend()
+    st.pyplot(fig)
+
+    # Summary stats
+    evaluator = Evaluator()
+    agg_metrics, item_metrics = evaluator(test_data, forecasts, num_series=len(test_data))
+    st.write("📊 Forecast Evaluation Metrics:")
+    st.json(agg_metrics)
