@@ -1,0 +1,27 @@
+tab1:
+fig.add_shape(
+    type="line",
+    x0=df_test["ds"].min(), x1=df_test["ds"].max(),
+    y0=benchmark_threshold, y1=benchmark_threshold,
+    line=dict(color="orange", dash="dot"),
+    name="Monthly Benchmark Threshold",
+    layer="above"
+)
+fig.add_annotation(
+    x=df_test["ds"].max(), y=benchmark_threshold,
+    text="Monthly Benchmark", showarrow=False, yshift=10, font=dict(color="orange")
+)
+
+tab2:
+fig2.add_shape(
+    type="line",
+    x0=df_test["ds"].min(), x1=df_test["ds"].max(),
+    y0=benchmark_threshold, y1=benchmark_threshold,
+    line=dict(color="orange", dash="dot"),
+    name="Monthly Benchmark Threshold",
+    layer="above"
+)
+fig2.add_annotation(
+    x=df_test["ds"].max(), y=benchmark_threshold,
+    text="Monthly Benchmark", showarrow=False, yshift=10, font=dict(color="orange")
+)
