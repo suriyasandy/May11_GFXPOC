@@ -1,0 +1,29 @@
+# After forecasting volatility using Prophet
+df_test["y"] = forecast.tail(30)["yhat"]  # or your actual test y
+f_test = forecast.tail(30).copy()
+
+# Step 1: Calculate monthly benchmark from Prophet CI
+benchmark_threshold = f_test["yhat_upper"].max()
+
+# Step 2: Detect regime breaches
+f_test["ObservedVol"] = df_test["y"].values
+f_test["BreachedBenchmark"] = f_test["ObservedVol"] > benchmark_threshold
+f_test["PersistentBreach"] = f_test["BreachedBenchmark"].rolling(3).sum() >= 3
+
+# Step 3: Plot on Streamlit using plotly
+import plotly.graph_objects as go
+
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(x=f_test["ds"], y=f_test["ObservedVol"], name="Observed Volatility", line=dict(color="black")))
+fig2.add_trace(go.Scatter(x=f_test["ds"], y=f_test["yhat_upper"], name="Prophet Upper CI", line=dict(dash="dot", color="blue")))
+fig2.add_hline(y=benchmark_threshold, line_dash="dashdot", line_color="orange", annotation_text="Monthly Benchmark Threshold")
+
+# Add regime breach markers
+breach_dates = f_test["ds"][f_test["PersistentBreach"]]
+breach_vals = f_test["ObservedVol"][f_test["PersistentBreach"]]
+fig2.add_trace(go.Scatter(x=breach_dates, y=breach_vals, mode="markers", name="Regime Breach",
+                          marker=dict(color="purple", symbol="star", size=10)))
+
+fig2.update_layout(title="Prophet CI & Monthly Benchmark Threshold",
+                   xaxis_title="Date", yaxis_title="Annualized Volatility")
+st.plotly_chart(fig2, use_container_width=True)
