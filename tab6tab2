@@ -1,0 +1,104 @@
+    with tab2:
+        currencies = df["Currency"].unique().tolist()
+        pairs = [(b, q) for b in currencies for q in currencies if b != q]
+        selected_pair = st.selectbox("Select Cross Pair", [f"{b}/{q}" for b, q in pairs])
+        base_ccy, quote_ccy = selected_pair.split("/")
+
+        base = df[df["Currency"] == base_ccy].copy()
+        quote = df[df["Currency"] == quote_ccy].copy()
+        merged = pd.merge(base, quote, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}"))
+        merged["Synthetic"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
+        merged["LogReturn"] = np.log(merged["Synthetic"] / merged["Synthetic"].shift(1))
+        merged["Volatility"] = merged["LogReturn"].rolling(roll_window, min_periods=roll_window).std() * np.sqrt(252)
+        df_syn = merged[["Date", "Volatility"]].dropna().rename(columns={"Date": "ds", "Volatility": "y"})
+
+        if len(df_syn) < 60:
+            st.warning("Not enough data for this pair.")
+            return
+
+        df_train = df_syn[:-30]
+        df_test = df_syn[-30:]
+        m = Prophet(interval_width=0.90, daily_seasonality=False)
+        m.fit(df_train)
+        forecast = m.predict(df_syn[["ds"]])
+        f_test = forecast.tail(30)
+
+        # Monthly benchmark threshold
+        benchmark_threshold = f_test["yhat_upper"].max()
+
+        # Manual threshold
+        df_summ = df_summary.set_index("Currency")
+        try:
+            base_th = df_summ.loc[base_ccy.upper(), "ManualThreshold"]
+            quote_th = df_summ.loc[quote_ccy.upper(), "ManualThreshold"]
+            manual_cross = max(base_th, quote_th)
+        except:
+            manual_cross = None
+
+        # Bollinger Band threshold
+        merged["BollingerUpper"] = merged["Volatility"].rolling(roll_window).mean() + 2 * merged["Volatility"].rolling(roll_window).std()
+
+        # GARCH-based volatility forecast
+        from arch import arch_model
+        returns = merged["LogReturn"].dropna() * 100
+        garch_forecast = [np.nan] * (roll_window - 1)
+        for i in range(roll_window, len(returns)):
+            try:
+                model = arch_model(returns[i-roll_window:i], vol='Garch', p=1, q=1, dist='normal')
+                res = model.fit(disp="off")
+                forecasted = res.forecast(horizon=1).variance.values[-1][0]
+                garch_forecast.append(np.sqrt(forecasted) * np.sqrt(252) / 100)
+            except:
+                garch_forecast.append(np.nan)
+        merged["GARCH_Forecast"] = [np.nan] + garch_forecast
+
+        merged_final = pd.merge(forecast[["ds", "yhat_upper"]], merged, left_on="ds", right_on="ds", how="inner")
+        merged_final["ProphetUpper"] = merged_final["yhat_upper"]
+
+        merged_final["Breach"] = (
+            (merged_final["y"] > merged_final["ProphetUpper"]) |
+            (merged_final["y"] > merged_final["BollingerUpper"]) |
+            (merged_final["y"] > merged_final["GARCH_Forecast"]) |
+            (merged_final["y"] > benchmark_threshold) |
+            (merged_final["y"] > manual_cross if manual_cross else False)
+        )
+
+        flagged_df = merged_final[-30:][merged_final["Breach"] == True]
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=merged_final["ds"], y=merged_final["y"], name="Synthetic Volatility", line=dict(color="gray")))
+        fig2.add_trace(go.Scatter(x=merged_final["ds"], y=merged_final["ProphetUpper"], name="Prophet Upper", line=dict(color="lightblue", dash="dot")))
+        fig2.add_trace(go.Scatter(x=merged_final["ds"], y=merged_final["BollingerUpper"], name="Bollinger Upper", line=dict(color="green", dash="dot")))
+        fig2.add_trace(go.Scatter(x=merged_final["ds"], y=merged_final["GARCH_Forecast"], name="GARCH Forecast", line=dict(color="purple", dash="dot")))
+
+        if manual_cross:
+            fig2.add_hline(y=manual_cross, line_color="red", line_dash="dash", annotation_text="Manual Threshold")
+
+        fig2.add_hline(y=benchmark_threshold, line_color="orange", line_dash="dot", annotation_text="Monthly Benchmark Threshold")
+
+        # Shaded region for benchmark
+        fig2.add_shape(
+            type="rect",
+            x0=df_test["ds"].min(), x1=df_test["ds"].max(),
+            y0=benchmark_threshold, y1=benchmark_threshold * 1.02,
+            fillcolor="orange", opacity=0.2, line_width=0, layer="below"
+        )
+
+        fig2.add_trace(go.Scatter(
+            x=flagged_df["ds"], y=flagged_df["y"],
+            mode="markers", name="Flagged Breach",
+            marker=dict(color="red", symbol="x", size=9),
+            text=["Breach"], hoverinfo="text+x+y"
+        ))
+
+        fig2.add_vrect(x0=df_test["ds"].min(), x1=df_test["ds"].max(),
+                       fillcolor="orange", opacity=0.08, line_width=0, annotation_text="Test Window")
+
+        fig2.update_layout(title=f"{base_ccy}/{quote_ccy}: Combined Thresholds (Prophet + Bollinger + GARCH + Manual + Benchmark)", height=650)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        if not flagged_df.empty:
+            st.markdown("### 🔍 Flagged Breaches Across All Methods")
+            st.dataframe(flagged_df[["ds", "y", "ProphetUpper", "BollingerUpper", "GARCH_Forecast"]].rename(columns={
+                "ds": "Date", "y": "Volatility"
+            }), use_container_width=True)
