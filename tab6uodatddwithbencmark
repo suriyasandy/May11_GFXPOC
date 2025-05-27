@@ -1,0 +1,99 @@
+def tab6_updated(df, df_summary, roll_window):
+    import streamlit as st
+    from prophet import Prophet
+    import plotly.graph_objects as go
+
+    st.header("📉 Tab 6: Volatility Forecast & Dynamic Thresholding (Prophet Model)")
+
+    tab1, tab2 = st.tabs(["Individual Currency", "Cross-Currency View"])
+
+    # --- Subtab 1: Individual Currency against USD ---
+    with tab1:
+        st.subheader("Single Currency Threshold View")
+        selected_currency = st.selectbox("Select Currency", df["Currency"].unique(), key="tab6_cur")
+
+        df_cur = df[df["Currency"] == selected_currency].copy().sort_values("Date")
+        df_cur = df_cur[["Date", "Volatility"]].dropna().rename(columns={"Date": "ds", "Volatility": "y"})
+
+        df_train = df_cur[:-30]
+        df_test = df_cur[-30:]
+
+        m = Prophet(interval_width=0.90, daily_seasonality=False)
+        m.fit(df_train)
+        forecast = m.predict(df_cur[["ds"]])
+        f_test = forecast.tail(30).copy()
+
+        # Threshold logic
+        benchmark_threshold = f_test["yhat_upper"].max()
+        f_test["y"] = df_test["y"].values
+        f_test["PersistentBreach"] = f_test["y"] > benchmark_threshold
+
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=f_test["ds"], y=f_test["y"], name="Observed Volatility", line=dict(color="black")))
+        fig1.add_trace(go.Scatter(x=f_test["ds"], y=f_test["yhat_upper"], name="Prophet CI Upper", line=dict(dash="dot", color="blue")))
+        fig1.add_hline(y=benchmark_threshold, line_dash="dashdot", line_color="orange",
+                       annotation_text="Monthly Benchmark Threshold")
+
+        fig1.add_trace(go.Scatter(
+            x=f_test["ds"][f_test["PersistentBreach"]],
+            y=f_test["y"][f_test["PersistentBreach"]],
+            mode="markers", name="Breaches",
+            marker=dict(color="purple", symbol="star", size=10)
+        ))
+
+        fig1.update_layout(title=f"{selected_currency} Volatility Forecast with Prophet Threshold",
+                           xaxis_title="Date", yaxis_title="Annualized Volatility")
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # --- Subtab 2: Cross-Currency Synthetic Forecast ---
+    with tab2:
+        st.subheader("Cross-Currency Synthetic Forecast")
+
+        currencies = df["Currency"].unique().tolist()
+        cross_pairs = [(f"{b}{q}", b, q) for b in currencies for q in currencies if b != q]
+        pair_labels = [f"{p[0]} = {p[1]}USD ÷ {p[2]}USD" for p in cross_pairs]
+        pair_choice = st.selectbox("Select Cross Pair", pair_labels, index=0, key="tab6_crosspair")
+
+        if pair_choice:
+            pair_name, base_ccy, quote_ccy = cross_pairs[pair_labels.index(pair_choice)]
+
+            base_df = df[df["Currency"] == base_ccy][["Date", "Close"]].copy()
+            quote_df = df[df["Currency"] == quote_ccy][["Date", "Close"]].copy()
+            merged = pd.merge(base_df, quote_df, on="Date", suffixes=(f"_{base_ccy}", f"_{quote_ccy}"))
+
+            merged["SyntheticRate"] = merged[f"Close_{base_ccy}"] / merged[f"Close_{quote_ccy}"]
+            merged["LogReturn"] = np.log(merged["SyntheticRate"]).diff()
+            merged["Volatility"] = merged["LogReturn"].rolling(roll_window, min_periods=roll_window).std() * np.sqrt(252)
+
+            df_syn = merged[["Date", "Volatility"]].dropna().rename(columns={"Date": "ds", "Volatility": "y"})
+            df_train = df_syn[:-30]
+            df_test = df_syn[-30:]
+
+            m = Prophet(interval_width=0.90, daily_seasonality=False)
+            m.fit(df_train)
+            forecast = m.predict(df_syn[["ds"]])
+            f_test = forecast.tail(30).copy()
+
+            benchmark_threshold = f_test["yhat_upper"].max()
+            f_test["y"] = df_test["y"].values
+            f_test["BreachedBenchmark"] = f_test["y"] > benchmark_threshold
+            f_test["PersistentBreach"] = f_test["BreachedBenchmark"].rolling(3).sum() >= 3
+
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=f_test["ds"], y=f_test["y"], name="Observed Volatility", line=dict(color="black")))
+            fig2.add_trace(go.Scatter(x=f_test["ds"], y=f_test["yhat_upper"], name="Prophet CI Upper", line=dict(dash="dot", color="blue")))
+            fig2.add_hline(y=benchmark_threshold, line_dash="dashdot", line_color="orange",
+                           annotation_text="Monthly Benchmark Threshold")
+
+            fig2.add_trace(go.Scatter(
+                x=f_test["ds"][f_test["PersistentBreach"]],
+                y=f_test["y"][f_test["PersistentBreach"]],
+                mode="markers", name="Regime Breach",
+                marker=dict(color="purple", symbol="star", size=10)
+            ))
+
+            fig2.update_layout(
+                title=f"{pair_name}: Prophet CI & Monthly Benchmark Threshold",
+                xaxis_title="Date", yaxis_title="Annualized Volatility"
+            )
+            st.plotly_chart(fig2, use_container_width=True)
